@@ -1,0 +1,159 @@
+event LoginInit(Host, Browser, Id).
+event LoginAuthorized(Host, Id, Uri, bitstring).
+event ValidSession(Host, Browser, Uri, bitstring).
+event FileLeak(Host,Id,bitstring,bitstring).
+event FileRelease(bitstring, Id).
+
+query h:Host,id:Id,fname:bitstring,file:bitstring; event(FileLeak(h,id,fname,file)).
+
+query id:Id,u:Uri,file:bitstring; event(FileRelease(file, id)).
+
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring; event(LoginAuthorized(h,id,u,c)).
+
+query h:Host,b:Browser,uId:Id; event(LoginInit(h,b,uId)).
+
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring; event(LoginAuthorized(h,id,u,c)) ==> event(LoginInit(h,b,id)).
+
+(*
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring, file:bitstring; event(FileRelease(file, id)) ==> event(LoginInit(h,b,id)).
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring,file:bitstring; event(FileRelease(file, id)) ==> event(LoginAuthorized(h,id,u,c)).
+*)
+
+free spideroak:Host.
+fun loginPath():Path.
+fun sharedRoomPath():Path.
+fun storagePath():Path.
+fun browsePath():Path.
+
+fun loginSuccess(): bitstring [data].
+fun loginFailure(): bitstring [data].
+free loginForm : HTMLtag .
+fun loginFormReply(Id,Secret): Params [data].
+fun fileRequestParams(bitstring,bitstring): Params [data].
+fun JSON(bitstring): bitstring [data].
+fun newSession(Id):Session [data].
+
+free fileChannel:channel.
+
+table fileTable(Host, Id, bitstring, bitstring, bitstring, bitstring).
+(* host, uId, Key, File Name, Enc File *)
+
+table credentials(Host,Id,Secret).
+
+table serverSessions(Origin,Cookie,Session).
+
+letfun makeUser(h:Host) = 
+    new user: Id;
+    new pwd: Secret;
+    (user,pwd).
+
+letfun makeFile(u:Id) = 
+    new k:bitstring;
+    new file:bitstring;
+    new fname:bitstring;
+    (k,fname,file).
+
+fun newCookie(Host,Id):bitstring [private].
+
+let LoginApp(h:Host) =
+(
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=loginPath(),q) = u in
+   out(httpServerResponse,(u,httpOk(formGen(loginForm,u)),nullCookiePair(),corr)))
+| (in(httpServerRequest,(u:Uri,hs:Headers,req:HttpRequest,corr:bitstring));
+   let uri(=https(),=h,=loginPath(),q) = u in
+   let httpPost(loginFormReply(uId,pwd)) = req in
+   get credentials(=h,=uId,=pwd) in
+   let sC = newCookie(h,uId) in
+   let c = shcookie(sC) in
+   let cp = cookiePair(c,nullCookie()) in
+   event LoginAuthorized(h,uId,u,sC);
+   insert serverSessions(origin(u),c,newSession(uId));
+   let newURI = uri(https(), h, sharedRoomPath(), nullParams()) in
+   out(httpServerResponse,(u,httpRedirect(newURI),cp,corr)))).
+
+
+let LoginUserAgent(b:Browser) =
+  (let loginURI = uri(https(), spideroak, loginPath(), nullParams()) in
+   out(browserRequest(b),(loginURI, httpGet()));
+   in (newPage(b),(p1:Page,=loginURI,d:bitstring));
+   if loginForm = formTag(d) then
+   get credentials(=spideroak,uid,pwd) in
+   event LoginInit(spideroak, b, uid);
+   out(pageClick(b),(p1,loginURI,httpPost(loginFormReply(uid,pwd))))).
+
+(*--- SpiderOakBegin *)
+let SharedRoomUserAgent(b:Browser) =
+   in (newPage(b),(p:Page,u:Uri,d:bitstring));
+   let uri(=https(),=spideroak,=sharedRoomPath(),q) = u in
+   let keyURI = uri(https(), spideroak, storagePath(), nullParams()) in
+   out (ajaxRequest(b),(p,keyURI,httpGet()));
+   in (ajaxResponse(b),(=p,=keyURI,JSON((k:bitstring,name:bitstring))));
+   let fileURI = uri(https(), spideroak, browsePath(), fileRequestParams(k,name)) in
+   out(browserRequest(b),(fileURI, httpGet()));
+   in(newPage(b),(np:Page,=fileURI,file:bitstring)).
+
+let SharedRoomUserAgentSecure(b:Browser) =
+   in (newPage(b),(p:Page,u:Uri,d:bitstring));
+   let uri(=https(),=spideroak,=sharedRoomPath(),q) = u in
+   let keyURI = uri(https(), spideroak, storagePath(), nullParams()) in
+   out (ajaxRequest(b),(p,keyURI,httpGet()));
+   in (ajaxResponse(b),(=p,=keyURI,JSON(((salt:bitstring,ek:bitstring),name:bitstring))));
+   get credentials(=spideroak,uid,pwd) in
+   let uk = pbkdf2(pwd,salt) in
+   let k = adec(ek,uk) in
+   let fileURI = uri(https(), spideroak, browsePath(), fileRequestParams(k,name)) in
+   out(browserRequest(b),(fileURI, httpGet()));
+   in(newPage(b),(np:Page,=fileURI,file:bitstring)).
+
+let SharedRoomApp(h:Host) =
+(
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=sharedRoomPath(),q) = u in
+   let c = getCookie(hs) in
+   let cookiePair(cs,ch) = c in
+   get serverSessions(=origin(u),=cs,newSession(uId)) in
+   out(httpServerResponse,(u,httpOk(nullData),c,corr)))
+|
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=storagePath(),q) = u in
+   let c = getCookie(hs) in
+   let cookiePair(cs,ch) = c in
+   if ajax() = getAjax(hs) then
+   get serverSessions(=origin(u),=cs,newSession(uId)) in
+   get fileTable(=h, =uId, k, ek, fname, file) in
+   out(httpServerResponse,(u,httpOk(JSON((ek,fname))),c,corr)))
+|
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=browsePath(),q) = u in
+   let fileRequestParams(k,name) = q in
+   get fileTable(=h, uId, =k, ek, =name, file) in
+   event FileRelease(file, uId);
+   out(httpServerResponse,(u,httpOk(file),getCookie(hs),corr)))
+).
+
+(*--- SpiderOakEnd *)
+
+let FilePrivacy() =
+    in(fileChannel, data:bitstring);
+    get fileTable(h, uId, k, ek, name, =data) in
+    event FileLeak(h,uId,name,data).
+
+let CustomAppSecure() =
+    (new sk:privkey;
+     let pubk = pk(sk) in
+     insert serverIdentities(orig(https(),spideroak), pubk,sk,xdr());
+     out(pub,pubk))
+    |!(let(u:Id,p:Secret) = makeUser(spideroak) in
+       let(k:bitstring,fname:bitstring,file:bitstring) = makeFile(u) in
+       out (pub,(u,fname));
+       new salt:bitstring;
+       let uk = pbkdf2(p,salt) in
+       insert credentials(spideroak,u,p);
+       insert fileTable(spideroak,u,k,(salt,aenc(k,uk)),fname,file))
+    |(!LoginApp(spideroak) | !SharedRoomApp(spideroak))
+    |(!in(pub, b:Browser);(LoginUserAgent(b) | SharedRoomUserAgentSecure(b))). 
+
+process (
+    BrowserProcess() | HttpServer() | CustomAppSecure() | Network() | MaliciousApp() | FilePrivacy()
+)

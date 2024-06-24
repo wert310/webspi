@@ -1,0 +1,190 @@
+event LoginInit(Host, Browser, Id).
+event LoginAuthorized(Host, Id, Uri, Cookie).
+event ValidSession(Host, Browser, Uri, bitstring).
+event PaperReceived(bitstring).
+event PaperLeak(Id,bitstring).
+
+query paper:bitstring; event(PaperReceived(paper)).
+query u:Id,paper:bitstring; event(PaperLeak(u,paper)).
+
+query h:Host,b:Browser,uId:Id; event(LoginInit(h,b,uId)).
+query h:Host,b:Browser,id:Id,u:Uri,c:Cookie; event(LoginAuthorized(h,id,u,c)).
+query h:Host,b:Browser,id:Id,u:Uri,c:Cookie; event(LoginAuthorized(h,id,u,c)) ==> event(LoginInit(h,b,id)).
+
+(*
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring, file:bitstring; event(FileRelease(file, id)) ==> event(LoginInit(h,b,id)).
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring,file:bitstring; event(FileRelease(file, id)) ==> event(LoginAuthorized(h,id,u,c)).
+*)
+
+free confichair:Host.
+fun loginPath():Path.
+fun keyPursePath():Path.
+fun paperPath():Path.
+fun conferencePath():Path.
+fun changeRolePath():Path.
+
+fun kdf1(Secret): symkey. 
+fun kdf2(Secret): symkey.
+fun keypurse(symkey) : bitstring [data].
+
+fun storePassword(Secret):Data [data].
+fun storeKeypurse(symkey): Data [data].
+
+const authString:bitstring.
+letfun hmac(p:Secret) =
+   let hm = mac(authString,kdf1(p)) in
+   hm.
+
+fun loginSuccess(): bitstring [data].
+free loginForm : HTMLtag .
+fun loginFormReply(Id,Mac): Params [data].
+fun paperRequestParams(symkey,bitstring): Params [data].
+fun JSON(bitstring): bitstring [data].
+fun newSession(Id):Session [data].
+fun roleParams(bitstring):Params [data].
+
+free paperChannel:channel.
+
+table userData(Host, Id,Secret,bitstring).
+(* Host, UserId, Password, Paper *)
+table credentials(Host, Id, Mac).
+
+
+table conferenceDb(Host, Id,bitstring,bitstring).
+(* Host, UserId, Mac, keypurse, encrypted paper *)
+
+table serverSessions(Origin,Cookie,Session).
+
+fun newCookie(Host,Id):bitstring [private].
+letfun mkCookie(h:Host,uId:Id) = 
+   let sC = newCookie(h,uId) in
+   shcookie(sC).
+
+let LoginApp(h:Host) =
+(
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=loginPath(),q) = u in
+   out(httpServerResponse,(u,httpOk(formGen(loginForm,u)),nullCookiePair(),corr)))
+| (in(httpServerRequest,(u:Uri,hs:Headers,req:HttpRequest,corr:bitstring));
+   let uri(https(),=h,=loginPath(),q) = u in
+   let httpPost(loginFormReply(uId,m)) = req in
+   get credentials(=h,=uId,=m) in
+   let sid = mkCookie(h,uId) in
+   event LoginAuthorized(h,uId,u,sid);
+   insert serverSessions(origin(u),sid,newSession(uId));
+   let newURI = uri(https(), h, conferencePath(), nullParams()) in
+   let cp = cookiePair(sid,nullCookie()) in
+   out(httpServerResponse,(u,httpRedirect(newURI),cp,corr)))).
+
+let LoginUserAgent(b:Browser, h:Host) =
+  (let loginURI = uri(https(), h, loginPath(), nullParams()) in
+   out(browserRequest(b),(loginURI, httpGet()));   
+   in (newPage(b),(p1:Page,=loginURI,d:bitstring));
+   if loginForm = formTag(d) then
+   get userData(=confichair, uid, pwd, paper) in
+   let sk = hmac(pwd) in
+   in (getCookieStorage(b),(=p1,cookiePair(cs,ch),od:Data));
+   out (setCookieStorage(b),(p1,ch,storePassword(pwd)));
+   event LoginInit(confichair, b, uid);
+   out(pageClick(b),(p1,loginURI,httpPost(loginFormReply(uid,sk))))).
+
+(*--- ConfiChairBegin *)
+let ConferenceUserAgent(b:Browser, h:Host) =
+  (in (newPage(b),(p:Page,u:Uri,d:bitstring));
+   let uri(=https(),=h,=conferencePath(),q) = u in
+   (let keypurseURI = uri(https(), h, keyPursePath(), nullParams()) in
+    out (ajaxRequest(b),(p,keypurseURI,httpGet()));
+    in (ajaxResponse(b),(=p,=keypurseURI,JSON(x)));
+    in (getCookieStorage(b),(=p,cookiePair(cs,ch),z:Data));
+    let storePassword(pwd) = z in
+    let keypurse(k) = adec(x, kdf2(pwd)) in
+    out (setCookieStorage(b),(p,ch,storeKeypurse(k))))
+  |(let paperURI = uri(https(), h, paperPath(), nullParams()) in
+     out (ajaxRequest(b),(p,paperURI,httpGet()));
+     in (ajaxResponse(b),(=p,=paperURI,JSON(y)));
+     in (getCookieStorage(b),(=p,cookiePair(cs,ch),storeKeypurse(k)));
+     let paper = adec(y,k) in
+     event PaperReceived(paper))).
+
+let ConferenceApp(h:Host) =
+(
+    (in (httpServerRequest, (u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+    let uri(=https(),=h,=conferencePath(),q) = u in
+    let c = getCookie(hs) in
+    let cookiePair(cs,ch) = c in
+    get serverSessions(=origin(u),=cs,newSession(uId)) in
+    out(httpServerResponse,(u,httpOk(nullData),c,corr)))
+|
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=keyPursePath(),q) = u in
+   let c = getCookie(hs) in
+   let cookiePair(cs,ch) = c in
+   if ajax() = getAjax(hs) then
+   get serverSessions(=origin(u),=cs,newSession(uId)) in
+   get conferenceDb(=h, =uId, k, p) in
+   out(httpServerResponse,(u,httpOk(JSON(k)),c,corr)))
+|
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=paperPath(),q) = u in
+   let c = getCookie(hs) in
+   let cookiePair(cs,ch) = c in
+   if ajax() = getAjax(hs) then
+   get serverSessions(=origin(u),=cs,newSession(uId)) in
+   get conferenceDb(=h, =uId, k, p) in
+   out(httpServerResponse,(u,httpOk(JSON(p)),c,corr)))
+).
+
+let RoleUserAgent(b:Browser, h:Host) =
+    in (pub,x:bitstring);
+    let roleURI = uri(https(), h, changeRolePath(), roleParams(x)) in
+    out(browserRequest(b),(roleURI, httpGet()));
+    in (newPage(b),(p1:Page,=roleURI,y:bitstring));
+    out(pub, p1).
+
+let RoleApp(h:Host) =
+    (in (httpServerRequest, (u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+    let uri(=https(),=h,=changeRolePath(),roleParams(x)) = u in
+    let c = getCookie(hs) in
+    let cookiePair(cs,ch) = c in
+    get serverSessions(=origin(u),=cs,newSession(uId)) in
+    out(httpServerResponse,(u,httpOk(x),c,corr))).
+(* --- ConfiChairEnd --- *)
+
+let PaperPrivacy() =
+    in(paperChannel, paper:bitstring);
+    get userData(h, uId, k, =paper) in
+    event PaperLeak(uId,paper).
+
+letfun makeUser(h:Host) =
+    new user: Id;
+    new pwd: Secret;
+    (user,pwd).
+
+let CustomApp() =
+    (
+        new sk:privkey;
+        let pubk = pk(sk) in
+        insert serverIdentities(orig(https(),confichair), pubk,sk,noxdr());
+        out(pub,pubk);
+        ((!LoginApp(confichair)) | (!RoleApp(confichair)) | (!ConferenceApp(confichair)))
+    ) |
+    !(
+        in(pub, b:Browser);
+        (LoginUserAgent(b, confichair) | ConferenceUserAgent(b, confichair)  | RoleUserAgent(b, confichair))
+    ) |
+    !(
+        let(u:Id,p:Secret) = makeUser(confichair) in
+        out(net, u);
+        new k:symkey;
+        new paper:bitstring;
+        let m = hmac(p) in
+        let encPaper = aenc(paper, k) in
+        let encKey = aenc(keypurse(k), kdf2(p)) in
+        insert userData(confichair, u, p, paper);
+        insert credentials(confichair, u, m);
+        insert conferenceDb(confichair, u, encKey, encPaper)
+    ).
+
+process (
+    BrowserProcess() | CustomApp() | Network() | HttpServer() | !PaperPrivacy() (* | MaliciousApp()*)
+)

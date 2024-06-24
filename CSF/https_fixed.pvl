@@ -1,0 +1,463 @@
+(* Global settings *)
+set reconstructTrace = false.
+(*set traceBacktracking = false. *)
+set simplifyDerivation = true. 
+set unifyDerivation = true. 
+(*set attacker = passive.*)
+set predicatesImplementable=nocheck.
+
+letfun NetworkSetup() = true.
+letfun UntrustedWebsites() = true.
+letfun NetworkAttackers() = false.
+letfun MaliciousUsers() = false.
+letfun UntrustedJavaScript() = false. 
+letfun HttpRedirectors() = false. 
+letfun DynamicCompromise() = false.
+letfun MaliciousServers() = false. (* Use with care: This option may cause ProVerif to use up all your memory. *)
+
+(* Channels *)
+free net : channel [private]. (* Private Network *)
+free pub : channel. (* Public channel for communicating values with the attacker *)
+free admin : channel [private]. (* (Tainted) channel for accepting configuration information from the attacker *)
+free result : channel [private]. (* (Public) channel for returning configuration information to the attacker *)
+
+free httpClientRequest : channel [private].
+free httpClientResponse : channel [private].
+free httpServerRequest : channel [private]. 
+free httpServerResponse : channel [private].
+
+(* Datatypes *)
+
+
+(* User and client identities *)
+type Principal.
+type Id.     (* usernames, appIds *)
+type Secret. (* passwords, appSecrets *)
+free Anonymous:Id.
+
+type Browser.
+fun browser(Principal,Id): Browser [private].
+reduc forall p:Principal,id:Id; principal(browser(p,id)) = p.
+free empty:bitstring.
+
+(* Cookies *)
+type Cookie.
+free nullCookie:Cookie.
+fun mkCookie(bitstring): Cookie [data].
+fun cookiepair(Cookie,Cookie): Cookie [data].
+reduc forall c1:Cookie,c2:Cookie; all(cookiepair(c1,c2)) = c1.
+reduc forall c1:Cookie,c2:Cookie; secure(cookiepair(c1,c2)) = c2.
+letfun nullCookiePair() = cookiepair(nullCookie,nullCookie).
+free setCookie: channel [private].
+free getCookie: channel [private].
+free getCookieResult: channel [private].
+
+
+type Frame.
+fun frame(Browser,Cookie): Frame [data].
+
+(* Uri modeled as http[s]://Host:port/Path?Params *)
+type Host.
+type Protocol.
+type Path.
+fun https():Protocol.
+fun http():Protocol.
+type App.
+fun appUri(Host,Path): App [data].
+type Endpoint.
+fun endpoint(Protocol,App): Endpoint[data]. (* consciously leaving out port at the mo *)
+fun browserEP(Browser): Endpoint [data]. 
+reduc forall r:Protocol,h:Host,app:Path; host(endpoint(r,appUri(h,app))) = h.
+reduc forall r:Protocol,h:Host,app:Path; path(endpoint(r,appUri(h,app))) = app.
+reduc forall r:Protocol,a:App; protocol(endpoint(r,a)) = r.
+
+type Params.
+type Uri.
+fun uri(Endpoint,Params): Uri [data].
+fun noneUri() : Uri [data].
+reduc forall e:Endpoint,q:Params; ep(uri(e,q)) = e.
+reduc forall e:Endpoint,q:Params; params(uri(e,q)) = q.
+
+pred endpointUri(Endpoint,Protocol,Host,Path).
+clauses forall p:Protocol,h:Host,a:Path; endpointUri(endpoint(p,appUri(h,a)),p,h,a).
+
+letfun protocolCookie(e:Endpoint,c:Cookie) = 
+  if (protocol(e) = https()) then c 
+  else cookiepair(all(c),nullCookie).
+
+fun allCookie(Uri,bitstring): Cookie [private].
+fun secCookie(Cookie): Cookie [private].
+letfun makeCookies(u:Uri,c:bitstring) = 
+   let hc = allCookie(u,c) in (* Or: new hc:Cookie; *)
+   let sc = secCookie(hc) in (* Or: new sc:Cookie; *)
+     (hc,sc).
+
+(* Cryptography *)
+(* Authenticated Encryption *)
+type symkey.
+fun aenc(bitstring,symkey): bitstring.
+reduc forall b:bitstring,k:symkey; adec(aenc(b,k),k) = b.
+
+(* Hashing *)
+fun hash(bitstring) : bitstring.
+fun mac(bitstring,symkey): bitstring.
+
+(* Public-key Encryption and Signatures *)
+type privkey.
+type pubkey.
+fun pk(privkey):pubkey.
+fun wrap(symkey,pubkey): bitstring.
+reduc forall k:symkey,dk:privkey; unwrap(wrap(k,pk(dk)),dk) = k.
+fun sign(bitstring,privkey): bitstring.
+reduc forall b:bitstring,sk:privkey; verify(sign(b,sk),pk(sk)) = b.
+
+(* Derived notion of host-based encryption *)
+letfun hostenc(x:bitstring, host:Host, p:pubkey) = 
+  new k:symkey; 
+  (k,(wrap(k,p),aenc((host,x),k))).
+letfun hostdec(m:bitstring, host:Host, s:privkey) = 
+  let (ek:bitstring,ex:bitstring) = m in 
+  let k = unwrap(ek,s) in 
+  let (=host,x:bitstring) = adec(ex,k) in
+  (k,x).
+
+(* Derived notion of HTTP/HTTPS encryption *)
+free nullkey:symkey.
+letfun reqenc(e:Endpoint,x:bitstring,p:pubkey) = 
+  if (protocol(e) = https()) then hostenc(x,host(e),p)
+  else (nullkey,x).
+
+letfun reqdec(e:Endpoint,m:bitstring,s:privkey) = 
+  if (protocol(e) = https()) then hostdec(m,host(e),s) else (nullkey,m).
+letfun respenc(e:Endpoint,x:bitstring,k:symkey) = 
+  if (protocol(e) = https()) then aenc(x,k) else x.
+letfun respdec(e:Endpoint,m:bitstring,k:symkey) = 
+  if (protocol(e) = https()) then adec(m,k) else m.
+
+
+(* HTTP Requests and Responses *)
+
+type Headers.
+fun headers(Cookie,Uri): Headers [data]. 
+reduc forall c:Cookie, u:Uri; cookie(headers(c,u)) = c.
+reduc forall c:Cookie, u:Uri; referer(headers(c,u)) = u.
+
+type HttpRequest.
+fun httpGet():HttpRequest [data].
+fun httpPost(Params):HttpRequest [data].
+
+type HttpResponse.
+fun httpOk(bitstring):HttpResponse [data].
+fun httpRedirect(Uri):HttpResponse [data].
+fun httpError():HttpResponse [data].
+
+fun httpReq(Uri,Headers,HttpRequest) : bitstring [data].
+fun httpResp(HttpResponse,Cookie) : bitstring [data].
+
+(* Distributed security policies *)
+type Fact.
+pred assume(Fact) [block].
+pred fact(Fact).
+event Expect(Fact).
+query e:Fact; event(Expect(e)) ==> fact(e).
+
+fun Compromised(Principal) : Fact.
+fun Says(Principal,Fact) : Fact.
+
+clauses forall e:Fact; assume(e) -> fact(e);
+	forall p:Principal,e:Fact; fact(e) -> fact(Says(p,e));
+	forall p:Principal,e:Fact; fact(Compromised(p)) -> fact(Says(p,e)).
+
+(* Tables *)
+
+type Session.
+fun localLogin(Id):Session [data].
+fun socialLogin(Endpoint,Id,bitstring):Session [data].
+
+table credentials(Host,Path,Principal,Id,Secret).
+table serverIdentities(Host,Principal,pubkey,privkey). 
+table browserCookies(Browser,Host,Cookie). 
+table serverSessions(Host,Path,Cookie,Session). 
+(* cookies are not indexed only by host: need path and protocol too, and rules on sub-domains *)
+
+
+(* Website Forms *)
+
+type HTMLtag.
+fun formGen(HTMLtag,Uri,Cookie): bitstring [data].
+reduc forall c: Cookie, tag: HTMLtag, action:Uri; formId(formGen(tag,action,c))=c .
+reduc forall c: Cookie, tag: HTMLtag, action:Uri; formAction(formGen(tag,action,c))=action .
+reduc forall c: Cookie, tag: HTMLtag, action:Uri; formTag(formGen(tag,action,c))=tag .
+
+(* Events *)
+
+fun User(Principal,Id,Host,Path): Fact.
+fun Server(Principal,Host): Fact.
+
+(* Attacker Model *)
+
+type Command.
+type AppCommand.
+fun appCommand(AppCommand): Command [data].
+fun createServer(Principal): Command [data].
+fun createUser(Principal,Host,Path): Command [data].
+fun openBrowser(Principal): Command [data].
+fun surf(Browser,Uri): Command [data].
+
+fun createMaliciousServer(Principal): Command [data].
+fun createMaliciousUser(Principal,Host,Path): Command [data].
+fun compromiseUser(Id,Host,Path): Command [data].
+fun compromiseServer(Host): Command [data].
+
+fun compromiseConnection(Endpoint,Endpoint): Command [data].
+fun injectMessage(Endpoint,Endpoint,bitstring): Command [data].
+fun interceptMessage(Endpoint,Endpoint): Command [data].
+
+fun startUntrustedApp(App): Command [data].
+fun getServerRequest(App): Command [data].
+fun sendServerResponse(App,bitstring): Command [data].
+
+fun startRedirector(App,App): Command[data].
+
+fun httpRequestResponse(Cookie,Uri,HttpRequest): Command[data].
+fun getClientResponse(Browser,App): Command [data].
+fun sendClientRequest(Browser,App,Cookie,Uri,Uri,HttpRequest): Command [data].
+
+letfun conj(b1:bool,b2:bool) = 
+       if b1 = true && b2 = true then true
+       else false.
+
+let NetworkAttacker() = 
+    in (admin,compromiseConnection(e1,e2));
+((  in (admin,injectMessage(=e1,=e2,x));
+    out (net,(e1,e2,x)))
+|(  in (admin,injectMessage(=e2,=e1,x));
+    out (net,(e2,e1,x)))
+|(  in (admin,interceptMessage(=e1,=e2));
+    in (net,(=e1,=e2,x:bitstring));
+    out (result,(interceptMessage(e1,e2),x)))
+|(  in (admin,interceptMessage(=e2,=e1));
+    in (net,(=e2,=e1,x:bitstring));
+    out (result,(interceptMessage(e2,e1),x)))).
+
+letfun commandEnabled(c:Command) = 
+       let createServer(p) = c in NetworkSetup() else
+       let createUser(p,h,a) = c in NetworkSetup() else
+       let appCommand(ac) = c in NetworkSetup() else
+       let openBrowser(p) = c in NetworkSetup() else
+       let surf(b,r) = c in NetworkSetup() else
+       let httpRequestResponse(ck,u,req) = c in NetworkSetup() else 
+
+       let createMaliciousServer(p) = c in MaliciousServers() else
+       let createMaliciousUser(p,h,a) = c in MaliciousUsers() else
+       let compromiseUser(u,h,a) = c in conj(MaliciousUsers(),DynamicCompromise()) else
+       let compromiseServer(p) = c in conj(MaliciousServers(),DynamicCompromise()) else
+
+       let compromiseConnection(e1,e2) = c in NetworkAttackers() else
+       let injectMessage(e1,e2,x) = c in NetworkAttackers() else
+       let interceptMessage(e1,e2) = c in NetworkAttackers() else
+       
+       let startUntrustedApp(a) = c in UntrustedWebsites() else
+       let getServerRequest(a) = c in UntrustedWebsites() else
+       let sendServerResponse(a,x) = c in UntrustedWebsites() else
+       let getClientResponse(b,a) = c in conj(UntrustedWebsites(),UntrustedJavaScript()) else
+       let sendClientRequest(b,a,x,u,ref,req) = c in conj(UntrustedWebsites(),UntrustedJavaScript()) else
+
+       let startRedirector(a,b) = c in HttpRedirectors() else
+
+       false.
+
+let AttackerProxy() = 
+ (in (pub,x:Command);
+  if commandEnabled(x) = true then 
+  out(admin,x);
+  in (result,(=x,y:bitstring));
+  out(pub,y)).
+
+(* (Naive) Web Surfer *)
+
+fun pagelink(Uri):bitstring [data].
+fun pageform(Uri,Params):bitstring [data].
+
+let WebSurfer () = 
+((in (admin,openBrowser(p));
+  new bId:Id;
+  let b = browser(p,bId) in
+  out (result,(openBrowser(p),b)))
+|(in(admin,surf(b:Browser,u:Uri));
+  let p = principal(b) in
+  out(httpClientRequest,(b,nullCookiePair(),u,noneUri(),httpGet(),empty)))
+|(in(httpClientResponse,(b:Browser,sid:Cookie,sp:Principal,u:Uri,pagelink(newUri),corr:bitstring));
+  let p = principal(b) in
+  out(httpClientRequest,(b,sid,newUri,u,httpGet(),empty)))
+|(in(httpClientResponse,(b:Browser,sid:Cookie,sp:Principal,u:Uri,pageform(formUri,form),corr:bitstring));
+  let p = principal(b) in
+  out(httpClientRequest,(b,sid,formUri,u,httpPost(form),empty)))).
+
+(* Cookie Store *)
+letfun updateCookie(nc:Cookie,oc:Cookie) =
+     if oc = nullCookiePair() then nc
+     else oc.
+
+let CookieStore() = 
+  (in (getCookie,(b:Browser,h:Host));
+   get browserCookies(=b,=h,cookieIn) in
+   out (getCookieResult,(b,h,cookieIn)))
+| (in (getCookie,(b:Browser,h:Host));
+   out (getCookieResult,(b,h,nullCookiePair())))
+| (in (setCookie,(b:Browser,hostname:Host,cookieIn:Cookie));
+   insert browserCookies(b,hostname,cookieIn)).
+
+
+(* HTTP Client and Server *)
+
+let HttpClient() =
+  CookieStore |
+ (in(httpClientRequest,(b:Browser,sid:Cookie,u:Uri,ref:Uri,req:HttpRequest,corr:bitstring));
+  let cp = principal(b) in
+  let e = ep(u) in
+  if protocol(e) = https() || protocol(e) = http() then 
+  let hostname = host(e) in
+  get serverIdentities(=hostname,sp,pk_host,xxxx) in
+  out (getCookie,(b,hostname));
+  in (getCookieResult,(=b,=hostname,cookieIn:Cookie));
+  if (sid = nullCookiePair() || cookieIn = sid) then
+  let pc = protocolCookie(e,cookieIn) in
+  let reqmsg = httpReq(u,headers(pc,ref),req) in
+  let (k:symkey,m:bitstring) = reqenc(e,reqmsg,pk_host) in 
+  out(net,(browserEP(b),e,m));
+  in (net,(=e,=browserEP(b),x:bitstring));
+  let httpResp(resp,newCookie) = respdec(e,x,k) in
+  let npc = protocolCookie(e,newCookie) in
+  let nsid = updateCookie(npc,cookieIn) in
+  out (setCookie,(b,hostname,nsid)); 
+  ((let httpOk(data) = resp in
+    out(httpClientResponse,(b,nsid,sp,u,data,corr)))	
+  |(let httpRedirect(newUri) = resp in
+    out(httpClientRequest,(b,nullCookiePair(),newUri,ref,httpGet(),corr))))).
+
+fun correlator(symkey):bitstring [private].
+
+let HttpServer() = 
+  in(net,(browserEP(b),e:Endpoint,m:bitstring));
+  let hostname = host(e) in
+  get serverIdentities(=hostname,p,pk_P,sk_P) in
+  if protocol(e) = https() || protocol(e) = http() then 
+  let (k:symkey,httpReq(u,hs,req)) = reqdec(e,m,sk_P) in 
+  if (ep(u) = e) then
+  let corr = correlator(k) in  (* or: new corr:bitstring; *)
+  out(httpServerRequest,(u,req,hs,corr));
+  in(httpServerResponse,(=u,resp:HttpResponse,cookieOut:Cookie,=corr));
+  out(net,(e,browserEP(b),respenc(e,httpResp(resp,cookieOut),k))).
+
+(* Credential Factory *)
+fun password(Principal,Host,Path): Secret [private].
+fun userid(Secret): Id.
+reduc forall pwd:Secret; userpwd(userid(pwd)) = pwd [private].
+
+letfun makeUser(p:Principal,h:Host,a:Path) = 
+    new user: Id;
+    new pwd: Secret;
+    (user,pwd).
+(* Or:
+    let pwd = password(p,h,a) in
+    let user = userid(pwd) in
+    (user,pwd).   
+*)
+
+fun privateKey(Principal):privkey [private].
+fun hostid(privkey): Host.
+reduc forall sk:privkey; hostkey(hostid(sk)) = sk [private].
+reduc forall p:Principal; hostprincipal(hostid(privateKey(p))) = p.
+
+letfun makeHost(p:Principal) = 
+    let sk = privateKey(p) in
+    let h = hostid(sk) in
+    (h,sk). 
+
+let CredentialFactory() = 
+(  (in(admin,createUser(p:Principal,h:Host,a:Path));
+    let (uId:Id,sec:Secret) = makeUser(p,h,a) in
+    if assume(User(p,uId,h,a)) then
+    insert credentials(h,a,p,uId,sec);	
+    out(result,(createUser(p,h,a),uId)))
+|  (in(admin,createServer(p));
+    let (h:Host,skey:privkey) = makeHost(p) in
+    if assume(Server(p,h)) then
+    insert serverIdentities(h,p,pk(skey),skey);
+    out(result,(createServer(p),(h,pk(skey)))))
+|  (in(admin,createMaliciousUser(p:Principal,h:Host,a:Path));
+    let (uId:Id,sec:Secret) = makeUser(p,h,a) in
+    if assume(User(p,uId,h,a)) then
+    if assume(Compromised(p)) then
+    insert credentials(h,a,p,uId,sec);	
+    out(result,(createMaliciousUser(p,h,a),(uId,sec))))
+
+|  (in(admin,createMaliciousServer(p));
+    let (h:Host,skey:privkey) = makeHost(p) in
+    if assume(Server(p,h)) then
+    if assume(Compromised(p)) then
+    insert serverIdentities(h,p,pk(skey),skey);
+    out(result,(createMaliciousServer(p),(h,pk(skey),skey))))
+|  (in(admin,compromiseUser(uId,h,a));
+    get credentials(=h,=a,p,=uId,sec) in
+    if assume(Compromised(p)) then
+    out (result,(compromiseUser(uId,h,a),sec)))
+|  (in(admin,compromiseServer(h));
+    get serverIdentities(=h,p,pubk,sk) in
+    if assume(Compromised(p)) then
+    out (result,(compromiseServer(h),sk)))
+
+).
+
+(* HTTP Redirectors *)
+let HttpRedirector() = 
+   in (admin,startRedirector(appUri(h,a),appUri(h',a')));
+ (!in(httpServerRequest,(u:Uri,x:bitstring,hs:Headers,corr:bitstring));
+   if h = host(ep(u)) && a = path(ep(u)) then   
+   let c = cookie(hs) in
+   let redirectUri = uri(endpoint(protocol(ep(u)),appUri(h',a')),params(u)) in
+   out(httpServerResponse,(u,httpRedirect(redirectUri),c,corr))).
+
+(* Untrusted Website *)
+fun IsUntrustedApp(Host,Path): Fact.
+fun untrustedPath(Path):Path.
+
+let UntrustedApp() = 
+   in(admin,startUntrustedApp(appUri(h,a)));
+   let app = untrustedPath(a) in
+   if assume(IsUntrustedApp(h,app)) then
+(  (in(admin,getServerRequest(=appUri(h,app)));
+    in(httpServerRequest,(u:Uri,x:bitstring,hs:Headers,corr:bitstring));
+    if h = host(ep(u)) && app = path(ep(u)) && protocol(ep(u)) = http() then
+    out(result,(getServerRequest(appUri(h,app)),(u,x,hs,corr))))
+|  (in(admin,sendServerResponse(=appUri(h,app),(u:Uri,x:bitstring,ck:Cookie,corr:bitstring)));
+    if h = host(ep(u)) && app = path(ep(u)) && protocol(ep(u)) = http() then
+    out(httpServerResponse,(u,x,ck,corr)))
+|  (in(admin,getClientResponse(b,=appUri(h,app)));
+    in(httpClientResponse,(=b,sid:Cookie,sp:Principal,u:Uri,d:bitstring,corr:bitstring));
+    if h = host(ep(u)) && app = path(ep(u)) && protocol(ep(u)) = http() then
+    out(result,(getClientResponse(b,appUri(h,app)),(sid,sp,u,d))))
+|  (in(admin,sendClientRequest(b,=appUri(h,app),c,u,ref,req));
+    if h = host(ep(u)) && app = path(ep(u)) && protocol(ep(u)) = http() then
+    out(httpClientRequest,(b,c,u,ref,req,empty)))
+|  (in(admin,httpRequestResponse(c,u,req));
+    new b:Browser;
+    new corr:bitstring;
+    out(httpClientRequest,(b,c,u,noneUri(),req,corr));
+    in(httpClientResponse,(=b,sid:Cookie,sp:Principal,=u,resp:bitstring,=corr));
+    out(result,(httpRequestResponse(c,u,req),(sid,sp,httpOk(resp)))))	
+).
+
+
+
+let Network() = 
+    !CredentialFactory() | !HttpClient() | !HttpServer() | !WebSurfer()  
+  | !UntrustedApp() | !HttpRedirector() | !NetworkAttacker().    
+
+
+
+         
+
+
+

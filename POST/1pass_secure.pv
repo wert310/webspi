@@ -1,0 +1,127 @@
+event LoginInit(Host, Browser, Id).
+event LoginAuthorized(Host, Id, Uri, bitstring).
+event ValidSession(Host, Browser, Uri, bitstring).
+event PasswordFill(Origin, Id).
+event PasswordLeak(Host,Id,Secret).
+free prosecco:Host.
+
+
+query h:Host,u:Id,p:Secret; event(PasswordLeak(prosecco,u,p)).
+query h:Host,b:Browser,uId:Id; event(LoginInit(h,b,uId)).
+
+
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring; event(LoginAuthorized(h,id,u,c)).
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring; event(LoginAuthorized(h,id,u,c)) ==> event(LoginInit(h,b,id)).
+
+(*
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring, file:bitstring; event(FileRelease(file, id)) ==> event(LoginInit(h,b,id)).
+query h:Host,b:Browser,id:Id,u:Uri,c:bitstring,file:bitstring; event(FileRelease(file, id)) ==> event(LoginAuthorized(h,id,u,c)).
+*)
+
+type Principal.
+fun loginPath():Path.
+
+fun loginSuccess(): bitstring [data].
+free loginForm : HTMLtag .
+fun loginFormReply(Id,Secret): Params [data].
+fun newSession(Id):Session [data].
+fun extensionChannel(Browser):channel [private].
+
+table keychainStore(Principal, bitstring, Uri,Origin,bitstring,Mac).
+(* Principal, UUID, Location, Origin, Enc (User, Password) *)
+table masterTable(Principal,symkey).
+(* Master Password *)
+table hostCredentials(Host,Id,Secret).
+
+table serverSessions(Origin,Cookie,Session).
+
+fun newCookie(Host,Id):bitstring [private].
+
+let LoginApp(h:Host) =
+(
+   (in(httpServerRequest,(u:Uri,hs:Headers,=httpGet(),corr:bitstring));
+   let uri(=https(),=h,=loginPath(),q) = u in
+   out(httpServerResponse,(u,httpOk(formGen(loginForm,u)),nullCookiePair(),corr)))
+| (in(httpServerRequest,(u:Uri,hs:Headers,req:HttpRequest,corr:bitstring));
+   let uri(=https(),=h,=loginPath(),q) = u in
+   let httpPost(loginFormReply(uId,pwd)) = req in
+   get hostCredentials(=h,=uId,=pwd) in
+   let sC = newCookie(h, uId) in
+   let c = shcookie(sC) in
+   let cp = cookiePair(c,nullCookie()) in
+   event LoginAuthorized(h,uId,u,sC);
+   insert serverSessions(origin(u),c,newSession(uId));
+   out(httpServerResponse,(u,httpOk(loginSuccess()),cp,corr)))).
+
+
+(*--- OnePasswordBegin *)
+let LoginUserAgent(b:Browser,h:Host) =
+  (let loginURI = uri(https(), h, loginPath(), nullParams()) in
+   out(browserRequest(b),(loginURI, httpGet()));
+   in (newPage(b),(p1:Page,=loginURI,d:bitstring));
+   if loginForm = formTag(d) then
+   out(extensionChannel(b),p1);
+   in(extensionChannel(b), (=p1, id:Id, password:Secret));
+   event LoginInit(h, b, id);
+   out(pageClick(b),(p1,loginURI,httpPost(loginFormReply(id,password))))).
+
+let Extension(b:Browser,pr:Principal) =
+   !in (extensionChannel(b),pg:Page);
+    get pageOrigin(=pg,o,h,u) in
+    get masterTable(=pr,p) in
+    get keychainStore(=pr,uuid,location,=o,cipher,m) in
+    let (id:Id,pass:Secret) = adec(cipher,p) in
+    if mac((o,cipher),p) = m then
+    out (extensionChannel(b), (pg, id, pass)).
+(*--- OnePasswordEnd *)
+
+let ExtensionAttacker() = 
+   (!get keychainStore(pr,uuid,location,o,cipher,m) in
+    out (pub,(pr,uuid,location,o,cipher,m))) |
+   (!in  (pub,(pr:Principal,uuid:bitstring,location:Uri,o:Origin,cipher:bitstring,m:Mac));
+     insert keychainStore(pr,uuid,location,o,cipher,m)) |
+   (!in (pub,(b:Browser,p:Page));
+    out (extensionChannel(b), p);
+    in (extensionChannel(b), (=p, u:Id,pwd:Secret));
+    out (pub,(u,pwd))).
+
+let PasswordSecrecy() = 
+    (!in (pub,(h:Host,u:Id,pwd:Secret));
+      get hostCredentials(=h,=u,=pwd) in
+      event PasswordLeak(h,u,pwd)).
+      
+
+
+letfun makeUser(h:Host) = 
+    new user: Id;
+    new pwd: Secret;
+    (user,pwd).
+
+
+let CustomApp() =
+    (new sk:privkey;
+     let pubk = pk(sk) in
+     insert serverIdentities(orig(https(),prosecco), pubk,sk,xdr());
+     out(pub,pubk))
+
+    |(in (pub,b:Browser);
+      new pr:Principal; new mp:symkey; 
+      insert masterTable(pr,mp);
+      out (pub,pr);
+      Extension(b,pr))
+       
+    |!(in (pub,(x:Uri,pr:Principal));
+       get masterTable(=pr,mp) in
+       let h = host(x) in
+       let(u:Id,p:Secret) = makeUser(h) in
+       new uuid:bitstring;
+       let cipher = aenc((u,p),mp) in
+       insert keychainStore(pr, uuid, x, origin(x),cipher,mac((origin(x),cipher),mp));
+       insert hostCredentials(h,u,p);       
+       out (pub,u))
+    |!LoginApp(prosecco)
+    |!(in(pub, b:Browser);LoginUserAgent(b,prosecco)).    
+
+process (
+    BrowserProcess() | HttpServer() | CustomApp() | Network() | MaliciousApp() | ExtensionAttacker() | PasswordSecrecy()
+)
